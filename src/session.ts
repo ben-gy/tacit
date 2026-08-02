@@ -106,6 +106,8 @@ export class Session {
   private lastEventCount = 0;
   private botTimer: ReturnType<typeof setTimeout> | null = null;
   private claimAt = 0;
+  /** How many times we have asked to be re-dealt after a failed replay. Bounded on purpose. */
+  private needTries = 0;
   private attested = new Map<number, number[]>();
   private ended = false;
   private readonly poolSeed: number;
@@ -196,11 +198,23 @@ export class Session {
       const before = this.m.log.length;
       if (msg.log.length < before) return; // a stale broadcast from before a promotion
       if (!replay(this.m, msg.log)) {
-        // Our own hand disagrees with the host's history: ask to be dealt again rather than
-        // rendering a board that is quietly wrong.
-        this.deps.send({ t: 'need', mn: this.mission });
+        /**
+         * Our own hand disagrees with the host's history, so ask to be dealt again rather than
+         * render a board that is quietly wrong — but ASK ONLY A FEW TIMES.
+         *
+         * There is one position the host cannot answer from: a peer whose attestation was lost
+         * during a takeover has been played from a reconstruction, and the host has no opening hand
+         * to re-deal it. Unbounded asking then becomes a `need`/`log` storm that runs for the rest
+         * of the mission. After a handful of attempts this peer accepts it has fallen out of the
+         * mission and watches instead — a spectator is a legible state; a board frozen several
+         * plies behind, silently, is not.
+         */
+        if (++this.needTries <= 4) this.deps.send({ t: 'need', mn: this.mission });
+        else this.mySeat = null;
+        this.changed();
         return;
       }
+      this.needTries = 0;
       this.changed();
       return;
     }
@@ -460,9 +474,17 @@ export class Session {
     // What each seat still holds: one card fewer for every card it has already put on the table.
     const rest = [...pool];
     for (const seat of unknown) {
-      const played = m.seenBy.filter((s) => s === seat).length;
-      const owed = Math.max(0, m.setup.tricks - played);
+      const played = m.seen.filter((_, i) => m.seenBy[i] === seat);
+      const owed = Math.max(0, m.setup.tricks - played.length);
       m.hands[seat] = rest.splice(0, owed);
+      void played;
+      /**
+       * The OPENING deal is deliberately left null. Writing the reconstruction back would let the
+       * seat be re-dealt, but a fabricated opening hand cannot be replayed safely: give the seat a
+       * colour it never held and a discard it legally made becomes a revoke, so `replay` throws out
+       * the whole log. History is not ours to invent. The bounded `need` retry below is what stops
+       * a returning peer looping instead.
+       */
     }
   }
 

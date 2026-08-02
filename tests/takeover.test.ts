@@ -14,12 +14,13 @@
  * net-lifecycle.test.ts and host-election.test.ts guard the transport and the election themselves.
  *
  * The specific defects guarded:
+ *   - a draft step that each peer works out for itself, so a guest can never replay the host again;
  *   - a guest that applies its own moves locally (two divergent copies of a hidden-hand game);
- *   - a host that takes a guest's word for a card the guest does not hold;
+ *   - a host that takes a peer's word for a seat it does not occupy, or a card it does not hold;
  *   - a `deal` that carries somebody else's cards;
  *   - a rebuild that replays to a DIFFERENT position than the host it inherited from;
  *   - a rebuild that never finishes because one peer's `att` was dropped;
- *   - a seat whose peer walked out and that nobody drives afterwards.
+ *   - a seat whose peer walked out, or never answered, and that nobody drives afterwards.
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -28,7 +29,9 @@ import { chooseCard, chooseDraft, viewFor } from '../src/bot';
 import { modeOf } from '../src/modes';
 import {
   A_DRAFT,
+  A_PASS,
   A_PLAY,
+  actKind,
   actSeat,
   draftableFor,
   isOver,
@@ -236,10 +239,8 @@ function step(room: Room, host: Session): boolean {
 /**
  * Play exactly `actions` actions so the takeover lands mid-mission.
  *
- * The seeds every test passes to openRoom() were picked so the crew survives well past this point:
- * a mission that has already ended has no takeover to test. They were also picked to dodge the
- * draft-turn desync described in the report accompanying this file — a guest cannot always replay
- * the host's draft, and when it cannot, the room never converges.
+ * The seeds every test passes to openRoom() were picked so the crew survives well past this point —
+ * a mission that has already ended has no takeover to test.
  */
 function play(room: Room, host: Session, actions: number): void {
   for (let i = 0; i < actions; i++) {
@@ -305,12 +306,40 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
+// ── (0) the guest has to be able to replay the host's log at all ───────────────
+
+describe('every peer replays the same history', () => {
+  it('a seat that can take nothing PASSES in the log, rather than being silently skipped', () => {
+    // This fixture deals seat 2 every single candidate in the pool, so it cannot take anything under
+    // the own-hand rule and the draft has to walk past it. THE SKIP MUST BE AN ACTION IN THE LOG.
+    // Working it out per peer cannot work: only the host can see seat 2's hand, so a guest computes
+    // a different next drafter, its replay of the host's log fails, and it answers every broadcast
+    // with `need` — a room that never converges, from one unlucky deal. Found by this file before
+    // A_PASS existed; kept because the seed still reproduces it exactly.
+    const crew = openRoom({ poolSeed: 90_210, dealSeed: 0x51ce_d00d });
+    const { room } = crew;
+    const host = crew.at(0);
+    play(room, host, 6);
+
+    expect(
+      host.m!.log.some((a) => actKind(a) === A_PASS),
+      'this fixture is meant to force a seat to pass — if it no longer does, it is guarding nothing',
+    ).toBe(true);
+    for (const seat of [1, 2]) {
+      expect(crew.at(seat).m!.log, `seat ${seat} could not replay the host's draft`).toEqual(host.m!.log);
+      expect(position(crew.at(seat).m!), `seat ${seat} replayed to a different position`).toEqual(
+        position(host.m!),
+      );
+    }
+  });
+});
+
 // ── (1) a guest is not allowed to move the game on its own ─────────────────────
 
 describe('before any promotion, only the host moves the game', () => {
   it('a guest PROPOSES: submit() sends `act` and does not touch its own log', () => {
     const crew = openRoom();
-    const { room, ids } = crew;
+    const { room } = crew;
     const host = crew.at(0);
     const guest = crew.at(1);
 
@@ -497,7 +526,7 @@ describe('a promoted peer rebuilds the whole deal and the exact position', () =>
 
   it('the surviving guest is still in step with the new host afterwards', () => {
     const crew = openRoom();
-    const { room, ids } = crew;
+    const { room } = crew;
     play(room, crew.at(0), 14);
     const newHost = promote(crew, 0, 1);
     const guest = crew.at(2);
@@ -513,7 +542,7 @@ describe('a promoted peer rebuilds the whole deal and the exact position', () =>
 describe('the mission KEEPS RUNNING under the new host', () => {
   it('reaches an actual ending, with real actions, after the host walked out', () => {
     const crew = openRoom();
-    const { room, ids } = crew;
+    const { room } = crew;
     play(room, crew.at(0), 14);
     const newHost = promote(crew, 0, 1);
     const before = newHost.m!.log.length;
@@ -537,7 +566,7 @@ describe('the mission KEEPS RUNNING under the new host', () => {
   it('holds for every mode, including the one with no signals at all', () => {
     for (const modeId of ['aside', 'hush', 'runorder']) {
       const crew = openRoom({ modeId, mission: 6, poolSeed: 7007, dealSeed: 1_401_181_143 });
-      const { room, ids } = crew;
+      const { room } = crew;
       play(room, crew.at(0), 12);
       const newHost = promote(crew, 0, 1);
       expect(newHost.rebuilding, `${modeId}: the rebuild never finished`).toBe(false);
@@ -547,7 +576,7 @@ describe('the mission KEEPS RUNNING under the new host', () => {
 
   it('holds at four crew, where two seats are still live peers', () => {
     const crew = openRoom({ ids: ['a', 'b', 'c', 'd'], mission: 5, poolSeed: 1007, dealSeed: 2_654_435_761 });
-    const { room, ids } = crew;
+    const { room } = crew;
     play(room, crew.at(0), 16);
     const newHost = promote(crew, 0, 1);
 
@@ -564,7 +593,7 @@ describe('the mission KEEPS RUNNING under the new host', () => {
 describe('a two-player room needs no answer from anybody', () => {
   it('the survivor derives the dead host’s hand as the deck minus its own', () => {
     const crew = openRoom({ ids: ['a', 'b'], mission: 4 });
-    const { room, ids } = crew;
+    const { room } = crew;
     play(room, crew.at(0), 10);
 
     const attsBefore = room.msgs('att').length;
@@ -588,20 +617,10 @@ describe('a two-player room needs no answer from anybody', () => {
 
 // ── (6) a peer that never answers ──────────────────────────────────────────────
 
-/** What a peer would play from ITS OWN hand — the only one it can see. */
-function ownAction(s: Session, seat: number): number | null {
-  const m = s.m;
-  if (!m || m.phase !== 'play') return null;
-  const allowed = legalFor(m, seat);
-  if (allowed.length === 0) return null;
-  const wanted = chooseCard(viewFor(m, seat));
-  return packAct(A_PLAY, seat, allowed.includes(wanted) ? wanted : allowed[0]);
-}
-
 describe('a rebuild that one peer never answers still finishes', () => {
   it('the four-second window closes, the silent seat stays null, and the host adjudicates again', () => {
     const crew = openRoom({ ids: ['a', 'b', 'c', 'd'], mission: 5, poolSeed: 1007, dealSeed: 2_654_435_761 });
-    const { room, ids } = crew;
+    const { room } = crew;
     play(room, crew.at(0), 16);
 
     // Seat 3's channel drops the claim. Everything else about that peer is fine — it is still there,
@@ -635,9 +654,56 @@ describe('a rebuild that one peer never answers still finishes', () => {
     expect(sortHand(newHost.m!.setup.deal[1]!), 'the new host lost track of its own hand').toEqual(crew.opening[1]);
   });
 
-  it('and the seat it cannot see keeps playing, on trust', () => {
+  it('the silent seat is treated as EMPTY: the crew covers it and the mission reaches an ending', () => {
     const crew = openRoom({ ids: ['a', 'b', 'c', 'd'], mission: 5, poolSeed: 1007, dealSeed: 2_654_435_761 });
-    const { room, ids } = crew;
+    const { room } = crew;
+    play(room, crew.at(0), 16);
+    // The channel that dropped the claim stays down: a peer that cannot answer a claim is, as far as
+    // this room can tell, a peer that has gone.
+    room.mute('d');
+    const newHost = promote(crew, 0, 1);
+    for (let t = 0; t < 5000; t += 250) {
+      vi.advanceTimersByTime(250);
+      newHost.tick();
+      room.pump();
+    }
+    expect(newHost.rebuilding).toBe(false);
+
+    // Attestation is the liveness signal: no answer means nobody is behind that seat.
+    expect(newHost.abandoned.has(3), 'a seat that never answered has nobody behind it — the crew must cover it').toBe(
+      true,
+    );
+    // But NOT locked out: the peer id is kept, so a crewmate who was merely slow — a backgrounded
+    // tab, one dropped message — can take its own seat back the moment it acts.
+    expect(newHost.peerOfSeat[3], 'the seat was written off for good over one dropped message').toBe('d');
+
+    // The OPENING hand stays unknown, but the seat has to be holding something or the bot is handed
+    // an empty hand, finds no legal card, and the board silently stops being anybody's turn. That is
+    // the frozen board this file exists for, and it is the quietest possible version of it.
+    const m = newHost.m!;
+    const hand = m.hands[3];
+    expect(m.setup.deal[3], 'an opening hand nobody attested must not be invented — history cannot be rewritten').toBeNull();
+    expect(hand, 'the seat the host cannot see was left holding nothing at all').not.toBeNull();
+    expect(hand!.length, 'the reconstructed hand is the wrong size for the tricks already played').toBe(
+      m.setup.tricks - m.seenBy.filter((s) => s === 3).length,
+    );
+    const accounted = new Set([...m.seen, ...(m.hands[1] ?? []), ...(m.hands[2] ?? [])]);
+    expect(
+      hand!.filter((c) => accounted.has(c)),
+      'the reconstruction handed out cards that are already on the table or in a hand the host can see',
+    ).toEqual([]);
+
+    const before = m.log.length;
+    driveToEnd(room, newHost, 'the mission froze around the seat that never answered the claim');
+    expect(
+      m.log.slice(before).filter((a) => actSeat(a) === 3).length,
+      'the silent seat never played again — that seat is where the board froze',
+    ).toBeGreaterThan(0);
+  });
+
+  it('a peer that turns up late takes its own seat back off the crew', () => {
+    const crew = openRoom({ ids: ['a', 'b', 'c', 'd'], mission: 5, poolSeed: 1007, dealSeed: 2_654_435_761 });
+    const { room } = crew;
     play(room, crew.at(0), 16);
     room.mute('d');
     const newHost = promote(crew, 0, 1);
@@ -646,33 +712,16 @@ describe('a rebuild that one peer never answers still finishes', () => {
       newHost.tick();
       room.pump();
     }
-    room.unmute('d');
-    expect(newHost.rebuilding).toBe(false);
+    expect(newHost.abandoned.has(3), 'seat 3 should have been picked up by the crew').toBe(true);
 
-    // Every seat that still has somebody sitting in it moves the mission on — including seat 3,
-    // whose cards the new host has no way to check and therefore has to take on trust.
-    let played = 0;
-    let silentSeatPlayed = false;
-    for (let i = 0; i < 6; i++) {
-      const seat = seatToMove(newHost.m!);
-      if (!room.isLive(ids[seat])) break;
-      const act = ownAction(crew.at(seat), seat);
-      if (act === null) break;
-      const before = newHost.m!.log.length;
-      crew.at(seat).submit(act);
-      room.pump();
-      expect(newHost.m!.log.length, `seat ${seat}'s action was thrown away after the rebuild`).toBe(before + 1);
-      if (seat === 3) silentSeatPlayed = true;
-      played++;
-    }
-    expect(played, 'nothing at all could be played once the window closed').toBeGreaterThan(0);
+    // Speaking at all is proof of life. It does not matter whether this particular action is legal —
+    // what matters is that a crewmate who is demonstrably still there stops being played by a bot.
+    room.unmute('d');
+    newHost.receive({ t: 'act', mn: newHost.mission, act: packAct(A_PLAY, 3, crew.opening[3][0]) }, 'd');
     expect(
-      silentSeatPlayed,
-      'the seat with the null hand could not play — a peer whose `att` was dropped is locked out of its own mission',
-    ).toBe(true);
-    expect(crew.at(3).m!.log, 'the silent seat drifted away from the host it is playing through').toEqual(
-      newHost.m!.log,
-    );
+      newHost.abandoned.has(3),
+      'the crewmate is right there and talking, and the bot is still playing their cards',
+    ).toBe(false);
   });
 });
 
